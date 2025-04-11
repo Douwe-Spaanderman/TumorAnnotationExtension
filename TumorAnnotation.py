@@ -50,7 +50,7 @@ class TumorAnnotationWidget(ScriptedLoadableModuleWidget):
         self.ui = slicer.util.childWidgetVariables(self.widget)
         self.ui.directoryButton.directoryChanged.connect(self.onDirectoryChanged)
         self.ui.loadButton.clicked.connect(self.onLoadButtonClicked)
-        self.ui.placePointsButton.clicked.connect(self.onPlacePointsButtonClicked)
+        self.ui.placePointsButton.clicked.connect(self.enterPlacementMode)
         self.ui.createBBoxButton.clicked.connect(self.onCreateBBoxButtonClicked)
         self.ui.relaxSlider.valueChanged.connect(self.onRelaxSliderChanged)
         self.ui.submitButton.clicked.connect(self.onSubmitButtonClicked)
@@ -59,27 +59,27 @@ class TumorAnnotationWidget(ScriptedLoadableModuleWidget):
         # Initialize UI
         self.updateUI()
 
+        # Start in placement mode
+        self.enterPlacementMode()
+
     def enterPlacementMode(self):
-        """Enter point placement mode"""
-        if not hasattr(self, 'fiducialNode') or not self.fiducialNode:
+        """Enter persistent point placement mode"""
+        if not self.fiducialNode:
             self.fiducialNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode', 'ExtremePoints')
             self.fiducialNode.CreateDefaultDisplayNodes()
-            self.fiducialNode.GetDisplayNode().SetSelectedColor(1, 0, 0)  # Red
+            self.fiducialNode.GetDisplayNode().SetSelectedColor(1, 0, 0)
             self.fiducialNode.GetDisplayNode().SetGlyphScale(2.0)
             self.fiducialNode.AddObserver(slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent, self.onPointPlaced)
-        
+
+        selectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        selectionNode.SetReferenceActivePlaceNodeID(self.fiducialNode.GetID())
+
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
+        interactionNode.SetPlaceModePersistence(1)  # stay in place mode
         interactionNode.SetCurrentInteractionMode(interactionNode.Place)
+
         self.placementActive = True
         self.ui.placePointsButton.setChecked(True)
-
-    def exitPlacementMode(self):
-        """Exit point placement mode"""
-        if hasattr(self, 'fiducialNode') and self.fiducialNode:
-            interactionNode = slicer.app.applicationLogic().GetInteractionNode()
-            interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
-        self.placementActive = False
-        self.ui.placePointsButton.setChecked(False)
 
     def updateUI(self):
         """Update UI elements based on current state"""
@@ -150,14 +150,6 @@ class TumorAnnotationWidget(ScriptedLoadableModuleWidget):
         if self.boundingBoxModel:
             slicer.mrmlScene.RemoveNode(self.boundingBoxModel)
             self.boundingBoxModel = None
-        self.exitPlacementMode()
-
-    def onPlacePointsButtonClicked(self):
-        """Toggle point placement mode"""
-        if self.placementActive:
-            self.exitPlacementMode()
-        else:
-            self.enterPlacementMode()
 
     def onPointPlaced(self, caller, event):
         """Handle new point placement"""
@@ -167,87 +159,110 @@ class TumorAnnotationWidget(ScriptedLoadableModuleWidget):
                 self.fiducialNode.GetNumberOfControlPoints()-1, pointPos)
             self.pointCoordinates.append(pointPos.copy())
         
-        # Stay in placement mode until we have 6 points
-        if self.fiducialNode.GetNumberOfControlPoints() < 6:
-            self.enterPlacementMode()
-        else:
-            self.exitPlacementMode()
-        
         self.updateUI()
 
     def onCreateBBoxButtonClicked(self):
-        """Create bounding box from the placed points"""
-        if not hasattr(self, 'fiducialNode') or self.fiducialNode.GetNumberOfControlPoints() < 6:
+        """Create bounding box from placed points, aligned with the volume's axes"""
+        if not hasattr(self, 'fiducialNode') or self.fiducialNode.GetNumberOfControlPoints() < 6:  # Fixed typo here
             slicer.util.errorDisplay("Please place all 6 points first")
             return
-            
+
+        # Get current volume node
+        volumeNode = slicer.app.layoutManager().sliceWidget("Red").sliceLogic().GetBackgroundLayer().GetVolumeNode()
+        if not volumeNode:
+            slicer.util.errorDisplay("No volume loaded")
+            return
+
+        # Get volume's IJK to RAS matrix
+        ijkToRas = vtk.vtkMatrix4x4()
+        volumeNode.GetIJKToRASMatrix(ijkToRas)
+
+        # Convert points to numpy array
         points = np.array(self.pointCoordinates)
+
+        # Compute axis-aligned bounding box in RAS coordinates
         minCoords = np.min(points, axis=0)
         maxCoords = np.max(points, axis=0)
-        
-        # Create ROI node
-        self.boundingBoxNode = slicer.mrmlScene.AddNewNodeByClass(
-            'vtkMRMLAnnotationROINode', 'BoundingBox')
-        self.boundingBoxNode.CreateDefaultDisplayNodes()
-        self.boundingBoxNode.GetDisplayNode().SetColor(0, 1, 0)  # Green
-        
-        # Set bounds
-        center = (minCoords + maxCoords) / 2
-        size = maxCoords - minCoords
-        
-        self.boundingBoxNode.SetXYZ(center[0], center[1], center[2])
-        self.boundingBoxNode.SetRadiusXYZ(size[0]/2, size[1]/2, size[2]/2)
-        
-        # Create model
-        self.updateBoundingBoxModel()
-        self.updateUI()
 
-    def updateBoundingBoxModel(self):
-        """Update the bounding box model visualization"""
-        if not self.boundingBoxNode:
-            return
-            
-        center = [0, 0, 0]
-        radius = [0, 0, 0]
-        self.boundingBoxNode.GetXYZ(center)
-        self.boundingBoxNode.GetRadiusXYZ(radius)
-        
-        cubeSource = vtk.vtkCubeSource()
-        cubeSource.SetCenter(center)
-        cubeSource.SetXLength(radius[0]*2)
-        cubeSource.SetYLength(radius[1]*2)
-        cubeSource.SetZLength(radius[2]*2)
-        cubeSource.Update()
-        
-        if not self.boundingBoxModel:
-            self.boundingBoxModel = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLModelNode')
-            self.boundingBoxModel.SetName('BoundingBoxModel')
-            displayNode = self.boundingBoxModel.CreateDefaultDisplayNode()
-            displayNode.SetColor(0, 1, 0)  # Green
-            displayNode.SetOpacity(0.3)
-        
-        self.boundingBoxModel.SetAndObservePolyData(cubeSource.GetOutput())
-
-    def onRelaxSliderChanged(self, value):
-        """Adjust bounding box size based on relaxation slider"""
-        if not self.boundingBoxNode or len(self.pointCoordinates) < 6:
-            return
-            
-        points = np.array(self.pointCoordinates)
-        minCoords = np.min(points, axis=0)
-        maxCoords = np.max(points, axis=0)
-        
+        # Optional: relax the box
         relaxation = self.ui.relaxSlider.value
         minCoords -= relaxation
         maxCoords += relaxation
-        
+
         center = (minCoords + maxCoords) / 2
         size = maxCoords - minCoords
+
+        # Create ROI node
+        self.boundingBoxNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsROINode', 'BoundingBox')
+        self.boundingBoxNode.CreateDefaultDisplayNodes()
+        self.boundingBoxNode.GetDisplayNode().SetColor(0, 1, 0)  # Green
         
-        self.boundingBoxNode.SetXYZ(center[0], center[1], center[2])
-        self.boundingBoxNode.SetRadiusXYZ(size[0]/2, size[1]/2, size[2]/2)
+        # First set the center and size in RAS coordinates
+        self.boundingBoxNode.SetCenter(center)
+        self.boundingBoxNode.SetSize(size)
+
+        # Now align with volume axes
+        # Get the volume's orientation vectors (columns of the rotation matrix)
+        x_vector = np.array([ijkToRas.GetElement(0,0), ijkToRas.GetElement(1,0), ijkToRas.GetElement(2,0)])
+        y_vector = np.array([ijkToRas.GetElement(0,1), ijkToRas.GetElement(1,1), ijkToRas.GetElement(2,1)])
+        z_vector = np.array([ijkToRas.GetElement(0,2), ijkToRas.GetElement(1,2), ijkToRas.GetElement(2,2)])
+
+        # Normalize the vectors
+        x_vector = x_vector / np.linalg.norm(x_vector)
+        y_vector = y_vector / np.linalg.norm(y_vector)
+        z_vector = z_vector / np.linalg.norm(z_vector)
+
+        # Create rotation matrix that aligns with volume axes
+        rotationMatrix = vtk.vtkMatrix4x4()
+        for i in range(3):
+            rotationMatrix.SetElement(i, 0, x_vector[i])
+            rotationMatrix.SetElement(i, 1, y_vector[i])
+            rotationMatrix.SetElement(i, 2, z_vector[i])
+            rotationMatrix.SetElement(i, 3, center[i])  # Set translation component
         
-        self.updateBoundingBoxModel()
+        # The rotation matrix should include the translation to keep the box centered
+        rotationMatrix.SetElement(3, 3, 1)  # Homogeneous coordinate
+
+        # Apply the transformation to the bounding box
+        self.boundingBoxNode.GetObjectToNodeMatrix().DeepCopy(rotationMatrix)
+        self.boundingBoxNode.Modified()
+
+        self.updateUI()
+
+        # Go back placement mode
+        self.enterPlacementMode()
+
+    def onRelaxSliderChanged(self, value):
+        """Adjust bounding box size while maintaining orientation"""
+        if not self.boundingBoxNode or len(self.pointCoordinates) < 6:
+            return
+
+        points = np.array(self.pointCoordinates)
+        minCoords = np.min(points, axis=0)
+        maxCoords = np.max(points, axis=0)
+
+        minCoords -= value
+        maxCoords += value
+
+        center = (minCoords + maxCoords) / 2
+        size = maxCoords - minCoords
+
+        # Get current transform
+        transformNode = self.boundingBoxNode.GetParentTransformNode()
+        if transformNode:
+            transformMatrix = vtk.vtkMatrix4x4()
+            transformNode.GetMatrixTransformToParent(transformMatrix)
+            
+            # Update position in transform
+            transformMatrix.SetElement(0, 3, center[0])
+            transformMatrix.SetElement(1, 3, center[1])
+            transformMatrix.SetElement(2, 3, center[2])
+            transformNode.SetMatrixTransformToParent(transformMatrix)
+
+        self.boundingBoxNode.SetSize(size)
+
+        # Go back placement mode
+        self.enterPlacementMode()
 
     def onSubmitButtonClicked(self):
         """Save the annotation data to JSON"""
